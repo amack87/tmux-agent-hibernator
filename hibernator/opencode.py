@@ -231,14 +231,26 @@ def discover_opencode_sessions() -> list[OpencodeSession]:
 
 
 def _get_session_info(session_id: str) -> Optional[dict]:
-    """Export a session and extract just its info block."""
+    """Export a session and extract just its info block.
+
+    Writes to a temp file to avoid pipe buffer limits on large sessions.
+    """
+    import tempfile
     try:
-        result = _run_opencode("export", session_id, "--sanitize", timeout=15)
-        if result.returncode != 0:
-            return None
-        data = json.loads(result.stdout)
-        return data.get("info")
-    except (json.JSONDecodeError, subprocess.TimeoutExpired, FileNotFoundError):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            tmp_path = f.name
+        try:
+            result = _run_opencode("export", session_id, "--sanitize", timeout=30, stdout_file=tmp_path)
+            if result.returncode != 0:
+                return None
+            data = json.loads(Path(tmp_path).read_text())
+            return data.get("info")
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+    except (json.JSONDecodeError, subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
 
 
