@@ -6,29 +6,36 @@ import logging
 import sys
 from pathlib import Path
 
-from hibernator.agents import ALL_AGENTS
+from hibernator.agents import ALL_AGENTS, AgentType
 from hibernator.config import IDLE_THRESHOLD_MINUTES, ensure_dirs
 from hibernator.db import get_session, init_db, list_all, list_hibernated
 from hibernator.daemon import run_check
 from hibernator.detect import discover_sessions, IdleTracker, SessionStatus, check_pane_status
 from hibernator.hibernate import hibernate_session
+from hibernator.opencode import (
+    discover_opencode_sessions,
+    hibernate_opencode_session,
+    restore_opencode_session,
+)
 from hibernator.restore import restore_session
 from hibernator.tmux import capture_pane
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
-    """Show all running AI agent tmux sessions with idle time."""
-    sessions = discover_sessions()
-    if not sessions:
+    """Show all running agent sessions (tmux + opencode) with idle time."""
+    tmux_sessions = discover_sessions()
+    opencode_sessions = discover_opencode_sessions()
+
+    if not tmux_sessions and not opencode_sessions:
         print("No active agent sessions found.")
         return
 
     tracker = IdleTracker()
 
-    print(f"{'Session':<25} {'Agent':<15} {'Status':<15} {'Idle':<12} {'Working Dir'}")
-    print("-" * 95)
+    print(f"{'Session':<30} {'Agent':<15} {'Status':<15} {'Idle':<12} {'Working Dir'}")
+    print("-" * 100)
 
-    for s in sessions:
+    for s in tmux_sessions:
         content = capture_pane(s.pane.pane_id) or ""
         idle_secs = tracker.update(s.pane.pane_id, content, s.status)
 
@@ -39,7 +46,10 @@ def cmd_status(_args: argparse.Namespace) -> None:
             idle_str = "-"
 
         agent_name = s.process.agent.display_name
-        print(f"{s.pane.session_name:<25} {agent_name:<15} {s.status.value:<15} {idle_str:<12} {s.pane.working_dir}")
+        print(f"{s.pane.session_name:<30} {agent_name:<15} {s.status.value:<15} {idle_str:<12} {s.pane.working_dir}")
+
+    for s in opencode_sessions:
+        print(f"{s.title:<30} {'opencode':<15} {'running':<15} {'-':<12} {s.directory}")
 
     tracker.save()
 
@@ -87,58 +97,108 @@ def cmd_agents(_args: argparse.Namespace) -> None:
     """List all supported agents."""
     print("Supported agents:\n")
     for agent in ALL_AGENTS:
-        patterns = ", ".join(agent.process_patterns)
-        print(f"  {agent.display_name:<20} slug: {agent.agent_type.value}")
-        print(f"  {'':20} process: {patterns}")
-        print(f"  {'':20} restore: {agent.restore_command}")
-        print()
+        if agent.agent_type == AgentType.OPENCODE:
+            print(f"  {agent.display_name:<20} slug: {agent.agent_type.value}")
+            print(f"  {'':20} discovered via: opencode CLI (not tmux)")
+            print(f"  {'':20} restore via: opencode import")
+            print()
+        else:
+            patterns = ", ".join(agent.process_patterns)
+            print(f"  {agent.display_name:<20} slug: {agent.agent_type.value}")
+            print(f"  {'':20} process: {patterns}")
+            print(f"  {'':20} restore: {agent.restore_command}")
+            print()
 
 
 def cmd_hibernate(args: argparse.Namespace) -> None:
-    """Manually hibernate a specific session."""
+    """Manually hibernate a specific session (tmux or opencode)."""
     target = args.session_name
-    sessions = discover_sessions()
 
+    # Check tmux sessions
+    tmux_sessions = discover_sessions()
     match = None
-    for s in sessions:
+    for s in tmux_sessions:
         if s.pane.session_name == target:
-            match = s
+            match = ("tmux", s)
             break
+
+    # Check opencode sessions
+    if match is None:
+        opencode_sessions = discover_opencode_sessions()
+        for s in opencode_sessions:
+            if s.title == target or s.session_id == target:
+                match = ("opencode", s)
+                break
 
     if match is None:
         print(f"No active agent session found with name '{target}'.")
-        if sessions:
+        all_sessions = []
+        for s in tmux_sessions:
+            all_sessions.append(f"  - {s.pane.session_name} ({s.process.agent.display_name}, {s.status.value})")
+        for s in discover_opencode_sessions():
+            all_sessions.append(f"  - {s.title} (opencode, running)")
+        if all_sessions:
             print("Active sessions:")
-            for s in sessions:
-                print(f"  - {s.pane.session_name} ({s.process.agent.display_name}, {s.status.value})")
+            for line in all_sessions:
+                print(line)
         sys.exit(1)
 
-    if match.status == SessionStatus.WORKING:
-        print(f"Session '{target}' is currently working. Force hibernate? (y/N) ", end="")
-        if input().strip().lower() != "y":
-            print("Aborted.")
-            return
+    match_type, match_session = match
 
-    print(f"Hibernating {match.process.agent.display_name} session '{target}'...")
-    result = hibernate_session(match)
+    if match_type == "tmux":
+        if match_session.status == SessionStatus.WORKING:
+            print(f"Session '{target}' is currently working. Force hibernate? (y/N) ", end="")
+            if input().strip().lower() != "y":
+                print("Aborted.")
+                return
+
+        print(f"Hibernating {match_session.process.agent.display_name} session '{target}'...")
+        result = hibernate_session(match_session)
+    else:
+        print(f"Hibernating opencode session '{target}'...")
+        result = hibernate_opencode_session(match_session)
 
     if result.success:
-        print(f"Hibernated successfully. Context saved to: {result.context_path}")
+        msg = f"Hibernated successfully."
+        if result.context_path:
+            msg += f" Context saved to: {result.context_path}"
+        print(msg)
     else:
         print(f"Failed: {result.error}")
         sys.exit(1)
 
 
 def cmd_restore(args: argparse.Namespace) -> None:
-    """Restore a hibernated session."""
+    """Restore a hibernated session (tmux or opencode)."""
     import json as json_mod
 
-    # Try to parse as int (ID) first, then use as name
+    from hibernator.db import get_session
+
+    # Look up the session in the database first
     try:
         session_id = int(args.target)
-        result = restore_session(session_id=session_id)
+        record = get_session(session_id=session_id)
     except ValueError:
-        result = restore_session(session_name=args.target)
+        record = get_session(session_name=args.target)
+
+    if record is None:
+        error_msg = f"Session '{args.target}' not found in database."
+        if getattr(args, "json", False):
+            print(json_mod.dumps({"success": False, "session_name": args.target, "error": error_msg}))
+            sys.exit(1)
+        print(f"Failed: {error_msg}")
+        sys.exit(1)
+
+    agent_type = record.get("agent_type", "claude")
+
+    if agent_type == "opencode":
+        result = restore_opencode_session(record["context_file_path"])
+    else:
+        try:
+            session_id_val = int(args.target)
+            result = restore_session(session_id=session_id_val)
+        except ValueError:
+            result = restore_session(session_name=args.target)
 
     if getattr(args, "json", False):
         print(json_mod.dumps({
@@ -151,7 +211,10 @@ def cmd_restore(args: argparse.Namespace) -> None:
         return
 
     if result.success:
-        print(f"Restored session '{result.session_name}'. Attach with: tmux attach -t {result.session_name}")
+        if agent_type == "opencode":
+            print(f"Restored opencode session '{result.session_name}'.")
+        else:
+            print(f"Restored session '{result.session_name}'. Attach with: tmux attach -t {result.session_name}")
     else:
         print(f"Failed: {result.error}")
         sys.exit(1)

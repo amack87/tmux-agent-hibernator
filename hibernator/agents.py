@@ -14,6 +14,7 @@ class AgentType(Enum):
     CLAUDE = "claude"
     CODEX = "codex"
     CURSOR = "cursor"
+    OPENCODE = "opencode"
 
 
 @dataclass(frozen=True)
@@ -169,11 +170,31 @@ CURSOR = AgentDefinition(
     session_id_pattern=None,
 )
 
+OPENCODE = AgentDefinition(
+    agent_type=AgentType.OPENCODE,
+    display_name="Opencode",
+    # Opencode sessions are discovered via ps + CLI (opencode.py), NOT via
+    # tmux panes. The process_patterns are intentionally empty so that the
+    # tmux-based discover_agent_processes() never matches opencode — if we
+    # included a "opencode" pattern here it would false-positive against
+    # tmux sessions visualized by the opencode-tmux plugin.
+    process_patterns=(),
+    process_excludes=(),
+    working_indicators=(),
+    input_indicators=(),
+    idle_indicators=(),
+    prompt_pattern=r"",
+    hibernation_prompt="",
+    restore_command="",
+    session_id_pattern=None,
+)
+
 # Registry: all supported agents, keyed by AgentType
 AGENTS: dict[AgentType, AgentDefinition] = {
     AgentType.CLAUDE: CLAUDE,
     AgentType.CODEX: CODEX,
     AgentType.CURSOR: CURSOR,
+    AgentType.OPENCODE: OPENCODE,
 }
 
 ALL_AGENTS: tuple[AgentDefinition, ...] = tuple(AGENTS.values())
